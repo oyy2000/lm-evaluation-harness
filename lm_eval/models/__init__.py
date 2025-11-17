@@ -19,8 +19,8 @@ from . import (
     textsynth,
     vllm_causallms,
     vllm_vlms,
+    steer_hf
 )
-
 
 # TODO: implement __all__
 

@@ -1,0 +1,59 @@
+task: triviaqa_cot
+dataset_path: trivia_qa
+dataset_name: rc.nocontext
+output_type: generate_until
+training_split: train
+validation_split: validation
+doc_to_text: |
+  Q: {{ question.strip() }}
+  A: Let's think step by step. After your reasoning, write the final answer on a new line in the exact format:
+  Final answer: <short answer>
+  Do not add anything after that line.
+doc_to_target: "{{answer.aliases}}"
+
+should_decontaminate: true
+doc_to_decontamination_query: question
+
+generation_kwargs:
+  do_sample: false
+  temperature: 0.0
+  max_new_tokens: 256
+  until:
+    - "\nQ:"          # few-shot 下一题
+    - "\n\nQ:"
+    - "###"
+    - "<eos>"
+
+
+# 通过正则在输出中抓取“最终答案”。你需要在生成时让模型以 "Final answer: xxx" 收尾（最稳）。
+filter_list:
+  - name: "strict-match"
+    filter:
+      - function: "regex"
+        # 抓取 'Final answer: <答案>' 的括号内内容
+        regex_pattern: "(?i)final answer:\\s*([^\\n\\r\\.;,]+)"
+      - function: "remove_whitespace"
+      - function: "take_first"
+  - name: "fallback-last-token"
+    filter:
+      # 1. 去掉首尾空白
+      # 2. 把整段按空白分词（得到 token 列表）
+        # 不写 delim，默认按空白
+      # 3. 取最后一个 token
+      # 4. 去掉标点
+      # 5. 去空白
+      - function: "remove_whitespace"
+      # 6. 如果还是 list，就拿第一个
+      - function: "take_first"
+
+target_delimiter: " "
+
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: true
+
+metadata:
+  version: 3.0
