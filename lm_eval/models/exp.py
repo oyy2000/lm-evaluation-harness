@@ -7,22 +7,20 @@ import subprocess
 import time
 from pathlib import Path
 from datetime import datetime
-import csv
 import signal
 import sys
 import shlex
+import json
 
-# ========= 配置区（按需修改） =========
-GPUS = [0, 1, 2]                # 并行使用的 GPU
+# ========= 配置 =========
+GPUS = [0, 1, 2]
 MODEL = "steer_hf"
 PRETRAINEDS = [
-    # "meta-llama/Llama-3.1-8B-Instruct",
     "mistralai/Mistral-7B-Instruct-v0.3",
-    # 你可以继续加
     "Qwen/Qwen2.5-7B-Instruct",
 ]
 
-TASKS = "triviaqa_cot,gsm8k_cot_zeroshot" #"triviaqa_cot,truthfulqa_gen_cot,gsm8k_cot_zeroshot"
+TASKS = "triviaqa_cot,gsm8k_cot_zeroshot"
 NUM_FEWSHOT = "0"
 APPLY_CHAT_TEMPLATE = True
 BATCH_SIZE = "auto"
@@ -30,49 +28,66 @@ LIMIT = "0.05"
 STEER_SPAN = 48
 
 STEER_LAYERS = [8, 12, 16, 20, 24]
-# baseline=0.0 也在列表里
 STEER_LAMBDAS = [0.0, 0.5, 1.0, 1.5, 2.0]
 
 BASE_OUTDIR = Path("./eval_grid") / TASKS.replace(",", "_").replace(" ", "_")
-RUNS_CSV = BASE_OUTDIR / "runs.csv"
-LOG_PATH = BASE_OUTDIR / "runs.log"     # << 新增：全局文本日志
-SKIP_IF_OUTDIR_EXISTS = True            # 目录下已有 metrics.json 则跳过该组合（断点续跑）
+RUNS_JSON = BASE_OUTDIR / "runs.json"
 
-# ========= 实现 =========
-def log_event(msg: str):
-    """向全局 log 追加一行，自动带时间戳。"""
-    ts = datetime.now().isoformat()
+RUNS_STATE = {}  # job_id -> 记录
+
+
+# ========= JSON 读写 =========
+def ensure_dirs():
     BASE_OUTDIR.mkdir(parents=True, exist_ok=True)
-    with LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {msg}\n")
-        
+
+
+def load_runs_state():
+    if not RUNS_JSON.exists():
+        return {}
+    try:
+        with RUNS_JSON.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("jobs", {})
+    except:
+        return {}
+
+
+def save_runs_state():
+    ensure_dirs()
+    payload = {
+        "updated_at": datetime.now().isoformat(),
+        "jobs": RUNS_STATE,
+    }
+    with RUNS_JSON.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+# ========= Job 定义 =========
 class Job:
     def __init__(self, pretrained: str, layer: int, lam: float):
         self.pretrained = pretrained
         self.layer = layer
         self.lam = float(lam)
         self.gpu = None
-
-        # 短模型名：只取最后一段，并把特殊字符替换掉
-        # meta-llama/Llama-3.1-8B-Instruct -> Llama-3.1-8B-Instruct
-        model_tag = pretrained.split("/")[-1].replace(":", "_")
-
-        tag = "BASELINE" if self.lam == 0.0 else f"lam{str(self.lam).replace('.', 'p')}"
-        # 输出目录名里带上模型名，防止不同模型覆盖同一个 outdir
-        safe_name = f"{model_tag}_L{layer}_{tag}"
-
-        self.outdir = BASE_OUTDIR / safe_name
-        self.stdout_log = self.outdir / "stdout.log"
-        self.stderr_log = self.outdir / "stderr.log"
         self.returncode = None
         self.start_ts = None
         self.end_ts = None
         self.proc = None
+        self.status = "pending"
+
+        model_tag = pretrained.replace("/", "_")
+        self.job_id = f"{model_tag}__L{layer}__lam{self.lam}"
+
+        tag = "BASELINE" if self.lam == 0.0 else f"lam{str(self.lam).replace('.', 'p')}"
+        safe_name = f"{pretrained.split('/')[-1]}_L{layer}_{tag}"
+        self.outdir = BASE_OUTDIR / safe_name
+        self.stdout_log = self.outdir / "stdout.log"
+        self.stderr_log = self.outdir / "stderr.log"
         self._last_cmd_list = None
 
     def build_cmd(self, gpu_id: int):
-        # --model_args 字符串里用自己的 pretrained
         json_path = f"/home/youyang7/projects/fact-enhancement/artifacts/{self.pretrained.replace('/', '_')}_factual_dirs.json"
+
         model_args = (
             f"pretrained={self.pretrained},"
             f"steer_layer={self.layer},"
@@ -80,6 +95,7 @@ class Job:
             f"steer_span={STEER_SPAN},"
             f"steer_json_path={json_path}"
         )
+
         cmd = [
             "lm_eval",
             "--model", MODEL,
@@ -94,83 +110,84 @@ class Job:
         ]
         if APPLY_CHAT_TEMPLATE:
             cmd.append("--apply_chat_template")
+
         self._last_cmd_list = cmd
         return cmd
 
     def cmd_as_str(self):
-        return shlex.join(self._last_cmd_list) if self._last_cmd_list else ""
+        return shlex.join(self._last_cmd_list or [])
+
+    def to_record(self):
+        duration = None
+        if self.start_ts and self.end_ts:
+            duration = (self.end_ts - self.start_ts).total_seconds()
+
+        return {
+            "job_id": self.job_id,
+            "pretrained": self.pretrained,
+            "layer": self.layer,
+            "lambda": self.lam,
+            "is_baseline": self.lam == 0.0,
+            "gpu": self.gpu,
+            "status": self.status,
+            "returncode": self.returncode,
+            "start_ts": self.start_ts.isoformat() if self.start_ts else None,
+            "end_ts": self.end_ts.isoformat() if self.end_ts else None,
+            "duration_sec": duration,
+            "outdir": str(self.outdir),
+            "stdout_log": str(self.stdout_log),
+            "stderr_log": str(self.stderr_log),
+            "cmd": self.cmd_as_str(),
+        }
 
 
-def ensure_dirs():
-    BASE_OUTDIR.mkdir(parents=True, exist_ok=True)
+# ========= 运行逻辑 =========
+def launch_job(job: Job, gpu_id: int):
+    global RUNS_STATE
 
-def write_runs_header_if_needed():
-    if not RUNS_CSV.exists():
-        with RUNS_CSV.open("w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "timestamp_start","timestamp_end","duration_sec",
-                "pretrained", "layer","lambda","is_baseline","gpu","returncode",
-                "output_path","stdout_log","stderr_log"
-            ])
-
-
-def append_run_row(job: Job):
-    duration = None
-    if job.start_ts and job.end_ts:
-        duration = (job.end_ts - job.start_ts)
-    with RUNS_CSV.open("a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            job.start_ts.isoformat() if job.start_ts else "",
-            job.end_ts.isoformat() if job.end_ts else "",
-            f"{duration.total_seconds():.3f}" if duration else "",
-            job.pretrained,
-            job.layer, job.lam, int(job.lam == 0.0),
-            job.gpu, job.returncode,
-            str(job.outdir), str(job.stdout_log), str(job.stderr_log)
-        ])
-
-
-def launch_job_on_gpu(job: Job, gpu_id: int):
     job.gpu = gpu_id
     job.outdir.mkdir(parents=True, exist_ok=True)
 
-    # 跳过逻辑：有 metrics.json 视为完成
-    if SKIP_IF_OUTDIR_EXISTS and (job.outdir / "metrics.json").exists():
-        job.start_ts = datetime.now()
-        job.end_ts = datetime.now()
-        job.returncode = 0
-        append_run_row(job)
-        log_event(f"SKIP  | GPU={gpu_id} L={job.layer} λ={job.lam} outdir={job.outdir} reason=metrics.json_exists")
-        print(f"[SKIP] {job.outdir} 已存在 metrics.json，跳过。")
-        return None
-
     cmd = job.build_cmd(gpu_id)
     cmd_str = job.cmd_as_str()
-    log_event(f"START | GPU={gpu_id} L={job.layer} λ={job.lam} outdir={job.outdir} cmd={cmd_str}")
     print(f"[LAUNCH] GPU {gpu_id} -> {cmd_str}")
+
+    job.start_ts = datetime.now()
+    job.status = "running"
+    RUNS_STATE[job.job_id] = job.to_record()
+    save_runs_state()
 
     stdout_f = job.stdout_log.open("w")
     stderr_f = job.stderr_log.open("w")
     env = os.environ.copy()
-    # 可选：限制可见 GPU（同时我们也用 --device 精确绑定了目标卡）
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, GPUS))
-    job.start_ts = datetime.now()
+
     proc = subprocess.Popen(cmd, stdout=stdout_f, stderr=stderr_f, env=env)
     job.proc = proc
     return proc
 
-def main():
-    ensure_dirs()
-    write_runs_header_if_needed()
-    log_event("SCHED | 初始化队列与日志")
 
-    # 所有作业（含 baseline=0.0）
+def main():
+    global RUNS_STATE
+    ensure_dirs()
+
+    RUNS_STATE = load_runs_state()
+    if RUNS_STATE:
+        print(f"[INFO] 发现 runs.json，启用断点续跑")
+
+    # === 生成队列 ===
     queue = []
     for pretrained in PRETRAINEDS:
         for (L, lam) in itertools.product(STEER_LAYERS, STEER_LAMBDAS):
-            queue.append(Job(pretrained, L, lam))
+            job = Job(pretrained, L, lam)
+            state = RUNS_STATE.get(job.job_id)
+
+            # 只依赖 runs.json 判断是否跳过
+            if state and state.get("status") == "done" and state.get("returncode") == 0:
+                print(f"[SKIP] {job.job_id} 已完成，跳过")
+                continue
+
+            queue.append(job)
 
     running = {g: None for g in GPUS}
 
@@ -181,36 +198,33 @@ def main():
         return None
 
     def handle_sigint(sig, frame):
-        log_event("CTRL | 捕获到 SIGINT，尝试终止子进程")
-        print("\n[CTRL-C] 捕获到中断信号，尝试终止子进程 ...")
+        print("\n[CTRL-C] 中断，关闭所有子进程...")
         for g, pair in running.items():
             if pair is not None:
                 job, proc = pair
-                try:
-                    proc.terminate()
-                    log_event(f"TERM  | GPU={g} L={job.layer} λ={job.lam} pid={proc.pid}")
-                except Exception as e:
-                    log_event(f"TERM_FAIL | GPU={g} L={job.layer} λ={job.lam} err={e}")
+                proc.terminate()
+                job.status = "failed"
+                job.end_ts = datetime.now()
+                RUNS_STATE[job.job_id] = job.to_record()
+        save_runs_state()
         sys.exit(1)
 
     signal.signal(signal.SIGINT, handle_sigint)
 
+    # === 主循环 ===
     while queue or any(running.values()):
-        # 尝试在空闲 GPU 上启动新作业
+        # 启动新 job
         while queue:
             g = available_gpu()
             if g is None:
                 break
             job = queue.pop(0)
-            proc = launch_job_on_gpu(job, g)
-            if proc is None:  # 被跳过
-                continue
+            proc = launch_job(job, g)
             running[g] = (job, proc)
 
-        # 轮询已在跑的作业
+        # 轮询
         time.sleep(5)
-        for g in list(running.keys()):
-            pair = running[g]
+        for g, pair in running.items():
             if pair is None:
                 continue
             job, proc = pair
@@ -218,28 +232,16 @@ def main():
             if ret is not None:
                 job.returncode = ret
                 job.end_ts = datetime.now()
-                append_run_row(job)
+                job.status = "done" if ret == 0 else "failed"
 
-                # 在日志里写结束标记
-                duration_s = ""
-                if job.start_ts and job.end_ts:
-                    duration_s = f"{(job.end_ts - job.start_ts).total_seconds():.1f}s"
-                log_event(f"END   | GPU={g} L={job.layer} λ={job.lam} rc={ret} dur={duration_s} outdir={job.outdir}")
+                RUNS_STATE[job.job_id] = job.to_record()
+                save_runs_state()
 
-                # 在各自日志文件里写一个结束标记
-                try:
-                    with job.stdout_log.open("a") as f:
-                        f.write(f"\n\n[JOB END] returncode={ret} @ {job.end_ts}\n")
-                    with job.stderr_log.open("a") as f:
-                        f.write(f"\n\n[JOB END] returncode={ret} @ {job.end_ts}\n")
-                except Exception:
-                    pass
-
-                print(f"[DONE] GPU {g} 完成：L={job.layer}, λ={job.lam} ({'BASELINE' if job.lam==0.0 else 'STEER'}), rc={ret}")
+                print(f"[DONE] GPU {g}, L={job.layer}, λ={job.lam}, rc={ret}, status={job.status}")
                 running[g] = None
 
-    log_event("SCHED | 全部任务完成")
-    print("\n[ALL DONE] 全部任务完成。汇总见:", RUNS_CSV, " & ", LOG_PATH)
+    print("\n[ALL DONE] 全部任务完成，结果见 runs.json")
+
 
 if __name__ == "__main__":
     main()
